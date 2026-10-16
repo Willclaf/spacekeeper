@@ -1,0 +1,1107 @@
+#!/bin/zsh
+# spacekeeper — keeps an eye on your Mac's free space and cleans only safe junk.
+# MIT License.
+
+emulate -R zsh
+setopt NULL_GLOB
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+
+VERSION="1.0.0"
+REPO="Willclaf/spacekeeper"
+SCRIPT="${0:A}"
+CONF_DIR="${SPACEKEEPER_DIR:-$HOME/.config/spacekeeper}"
+CONF="$CONF_DIR/config"
+HIST="$CONF_DIR/history.csv"
+STATE="$CONF_DIR/state"
+LOG="$HOME/Library/Logs/spacekeeper.log"
+LABEL="com.spacekeeper.watch"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+
+# Defaults — change them with `spacekeeper config`
+GOAL_GB=30            # minimum free space you want to keep
+AUTO_CLEAN=no         # clean safe junk automatically when below the goal
+CLEAN_CRASHES=yes     # delete crash-report storms automatically
+INTERVAL_HOURS=3      # how often the watcher runs
+LOG_DAYS=7            # logs older than this are junk
+DROP_ALERT_GB=10      # alert if free space drops this much in 24h
+CRASH_LIMIT=500       # how many crash reports count as a storm
+[[ -f $CONF ]] && source "$CONF"
+
+if [[ -t 1 ]]; then
+  B=$'\e[1m' D=$'\e[2m' R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' C=$'\e[36m' N=$'\e[0m'
+else
+  B= D= R= G= Y= C= N=
+fi
+
+# ─── helpers ─────────────────────────────────────────────────────────────────
+
+kb()     { du -sk "$1" 2>/dev/null | awk '{print $1+0}'; }
+
+# Runs a command but gives up after N seconds. Protects the scan from hanging while a
+# macOS privacy prompt (e.g. "access the Downloads folder") is waiting for an answer.
+limited() {
+  local secs=$1; shift
+  "$@" &
+  local job=$!
+  ( sleep $secs; kill $job 2>/dev/null ) &
+  local guard=$!
+  wait $job 2>/dev/null
+  local rc=$?
+  kill $guard 2>/dev/null
+  return $rc
+}
+kb_old() {
+  find "$1" -type f -mtime +$LOG_DAYS -print0 2>/dev/null | xargs -0 stat -f%z 2>/dev/null |
+    awk '{s+=$1} END{printf "%d\n", s/1024}'
+}
+# Decimal GB/MB, same as Finder and System Settings
+human()   { awk -v k="${1:-0}" 'BEGIN{ if(k<0)k=-k; b=k*1024; if(b>=1e9) printf "%.1f GB\n", b/1e9; else if(b>=1e6) printf "%.0f MB\n", b/1e6; else printf "%d KB\n", k }'; }
+gb_kb()   { print $(( $1 * 976562 )); }
+free_kb() { df -k "$HOME" | awk 'NR==2{print $4}'; }
+total_kb(){ df -k "$HOME" | awk 'NR==2{print $2}'; }
+short()   { print -r -- "${1/#$HOME/~}"; }
+heading() { print -r -- ""; print -r -- "${B}$1${N}"; }
+die()     { print -r -- "${R}✗${N} $1" >&2; exit 1; }
+log()     { mkdir -p "${LOG:h}"; print -r -- "$(date '+%F %T') $*" >> "$LOG"; }
+notify()  { osascript -e "display notification \"${2//\"/\'}\" with title \"${1//\"/\'}\"" >/dev/null 2>&1; }
+confirm() { local r; read -r "r?$1 [y/N] " || return 1; [[ $r == [yY]* ]]; }
+watching(){ launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; }
+
+# Only notify again after N seconds (avoids notification spam)
+can_notify() {
+  local now=$(date +%s) last
+  last=$(grep "^$1=" "$STATE" 2>/dev/null | cut -d= -f2)
+  (( now - ${last:-0} < $2 )) && return 1
+  mkdir -p "$CONF_DIR"
+  { grep -v "^$1=" "$STATE" 2>/dev/null; print "$1=$now"; } > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+}
+
+bar() {
+  local used=$1 total=$2 w=30 n i s=""
+  n=$(( used * w / total ))
+  for (( i = 0; i < w; i++ )); do
+    (( i < n )) && s+="█" || s+="░"
+  done
+  print -rn -- "$s"
+}
+
+# ─── catalog of what can be cleaned ──────────────────────────────────────────
+# tier|type|description|loc|who must be closed|note
+#   tier:  safe   = rebuilds itself (automatic cleaning may delete it)
+#          review = it's the user's; only removed if they pick it, and goes to the Trash
+#   type:  contents     delete everything inside the folder (the folder stays)
+#          old          delete files older than $LOG_DAYS days
+#          electron     delete an Electron app's internal caches
+#          trash-dir    move the whole folder to the Trash
+#          trash-old:DAYS:DEPTH:PATTERNS   move old files to the Trash
+#   closed: "-" nobody · "?" detect automatically (lsof) · "Name" process that must not be running
+
+crashpads() {
+  print -rl -- "$HOME/Library/Application Support"/*/Crashpad(N/) \
+               "$HOME/Library/Application Support"/*/*/Crashpad(N/) \
+               "$HOME/Library/Caches"/*/Crashpad(N/)
+}
+
+ELECTRON_CACHES=(Cache "Code Cache" GPUCache DawnGraphiteCache DawnWebGPUCache GrShaderCache ShaderCache)
+
+electron_dirs() {
+  local s
+  for s in $ELECTRON_CACHES; do [[ -d $1/$s ]] && print -r -- "$1/$s"; done
+}
+
+targets() {
+  local c s a L="$HOME/Library" AS="$HOME/Library/Application Support" CA="$HOME/Library/Caches"
+  # crash reports from any app
+  for c in ${(f)"$(crashpads)"}; do
+    for s in pending completed new; do
+      [[ -d $c/$s ]] && print -r -- "safe|contents|Crash reports — ${c:h:t}|$c/$s|-|"
+    done
+  done
+  print -r -- "safe|old|Logs older than $LOG_DAYS days|$L/Logs|-|"
+
+  # browsers
+  print -r -- "safe|contents|Chrome cache|$CA/Google/Chrome|Google Chrome|"
+  print -r -- "safe|contents|Edge cache|$CA/Microsoft Edge|Microsoft Edge|"
+  print -r -- "safe|contents|Brave cache|$CA/BraveSoftware|Brave Browser|"
+  print -r -- "safe|contents|Opera GX cache|$CA/com.operasoftware.OperaGX|Opera GX|"
+  print -r -- "safe|contents|Arc cache|$CA/Arc|Arc.app|"
+  print -r -- "safe|contents|Firefox cache|$CA/Firefox|firefox|"
+
+  # creative apps
+  print -r -- "safe|contents|Camera Raw cache (Lightroom/Photoshop)|$CA/Adobe Camera Raw 2|Lightroom|"
+  print -r -- "safe|contents|Spotify cache|$CA/com.spotify.client|Spotify|"
+
+  # AI tools
+  print -r -- "safe|contents|Codex cache|$CA/Codex|?|"
+  print -r -- "safe|contents|Codex downloaded runtimes|$HOME/.cache/codex-runtimes|?|Downloaded again when Codex needs them"
+  print -r -- "safe|contents|Claude Code cache|$CA/claude-cli-nodejs|?|"
+  print -r -- "safe|contents|Hugging Face cache (Xet)|$HOME/.cache/huggingface/xet|?|"
+
+  # developer tools
+  print -r -- "safe|contents|npm cache|$HOME/.npm/_cacache|-|"
+  print -r -- "safe|contents|pip cache|$CA/pip|-|"
+  print -r -- "safe|contents|uv cache (Python)|$HOME/.cache/uv|?|"
+  print -r -- "safe|contents|pnpm cache|$CA/pnpm|-|"
+  print -r -- "safe|contents|Yarn cache|$CA/Yarn|-|"
+  print -r -- "safe|contents|Homebrew cache|$CA/Homebrew|brew|"
+  print -r -- "safe|contents|Go build cache|$CA/go-build|-|"
+  print -r -- "safe|contents|CocoaPods cache|$CA/CocoaPods|-|"
+  print -r -- "safe|contents|Xcode DerivedData|$L/Developer/Xcode/DerivedData|Xcode.app|"
+
+  # already-downloaded updates
+  for c in "$CA"/*ShipIt(N/); do
+    print -r -- "safe|contents|Downloaded update — ${${c:t:r}##*.}|$c|-|"
+  done
+
+  # internal caches of Electron apps (Claude, Codex, Cursor, VS Code, Slack, Discord, Figma…)
+  for a in "$AS"/*(N/); do
+    [[ -n $(electron_dirs "$a") ]] && print -r -- "safe|electron|${${a:t}##*.} app cache|$a|?|"
+  done
+
+  # review: belongs to the user, goes to the Trash
+  print -r -- "review|trash-old:14:1:*.dmg *.pkg *.iso *.xip|Old installers in Downloads|$HOME/Downloads|-|.dmg/.pkg files older than 14 days. Moved to the Trash"
+  print -r -- "review|trash-old:90:6:*.jsonl|Codex conversations older than 90 days|$HOME/.codex/sessions|?|Old history disappears from Codex. Moved to the Trash"
+  print -r -- "review|trash-dir|Hugging Face AI models|$HOME/.cache/huggingface/hub|?|Downloaded again if a program needs them. Moved to the Trash"
+  print -r -- "review|contents|Playwright browsers|$CA/ms-playwright|?|Playwright automations will need to download them again"
+  print -r -- "review|contents|Xcode iPhone support files|$L/Developer/Xcode/iOS DeviceSupport|Xcode.app|Xcode rebuilds them when you connect an iPhone"
+}
+
+# short format (type|description|loc|closed), safe items only
+safe_targets() {
+  local tier type desc loc cond note
+  targets | while IFS='|' read -r tier type desc loc cond note; do
+    [[ $tier == safe ]] && print -r -- "$type|$desc|$loc|$cond"
+  done
+}
+
+old_files() {   # $1 = trash-old:DAYS:DEPTH:PATTERNS  $2 = folder  → \0-separated list
+  local -a p pats expr
+  p=("${(@s.:.)1}")
+  pats=(${=p[4]})
+  local x
+  for x in $pats; do expr+=(-o -iname "$x"); done
+  expr=("${(@)expr[2,-1]}")
+  limited 20 find "$2" -maxdepth $p[3] -type f \( "${(@)expr}" \) -mtime +$p[2] -print0 2>/dev/null
+}
+
+sum_kb() { xargs -0 stat -f%z 2>/dev/null | awk '{s+=$1} END{printf "%d\n", s/1024}'; }
+
+measure() {
+  local t=0 d
+  case $1 in
+    contents|trash-dir) kb "$2" ;;
+    old)      kb_old "$2" ;;
+    electron) for d in ${(f)"$(electron_dirs "$2")"}; do (( t += $(kb "$d") )); done; print $t ;;
+    trash-old:*) old_files "$1" "$2" | sum_kb ;;
+  esac
+}
+
+# Who is using it? Empty = safe to clean. Otherwise, the name of the app that must be closed.
+in_use_by() {
+  local type=$1 loc=$2 cond=$3 name d
+  case $cond in
+    -|"") return 0 ;;
+    \?)
+      local -a dirs
+      if [[ $type == electron ]]; then dirs=(${(f)"$(electron_dirs "$loc")"}); else dirs=("$loc"); fi
+      for d in $dirs; do
+        name=$(lsof +D "$d" -Fc 2>/dev/null | sed -n 's/^c//p' | head -1)
+        if [[ -n $name ]]; then
+          name=${name//\\x20/ }
+          name=${${${name% Helper*}% \(*}%.app}
+          print -r -- "$name"
+          return 0
+        fi
+      done ;;
+    *)
+      pgrep -fi -- "$cond" >/dev/null 2>&1 && print -r -- "${${cond//|/ or }%.app}" ;;
+  esac
+}
+
+# Move to the Trash (recoverable). macOS 15+: /usr/bin/trash; older: through Finder.
+move_to_trash() {
+  (( $# )) || return 0
+  if [[ -x /usr/bin/trash ]]; then
+    /usr/bin/trash "$@" 2>/dev/null
+  else
+    local f
+    for f; do
+      osascript -e 'on run a' -e 'tell application "Finder" to delete (POSIX file (item 1 of a) as alias)' -e 'end run' "$f" >/dev/null 2>&1
+    done
+  fi
+  return 0
+}
+
+delete_target() {
+  local d
+  # dry-run mode: does everything except deleting
+  [[ -n $SPACEKEEPER_DRY_RUN ]] && { print -r -- "[dry-run] $1 $2" >> "$CONF_DIR/dry-run.log"; return 0; }
+  case $1 in
+    contents) find "$2" -mindepth 1 -delete 2>/dev/null ;;
+    old)      find "$2" -type f -mtime +$LOG_DAYS -delete 2>/dev/null
+              find "$2" -mindepth 1 -type d -empty -delete 2>/dev/null ;;
+    electron) for d in ${(f)"$(electron_dirs "$2")"}; do find "$d" -mindepth 1 -delete 2>/dev/null; done ;;
+    trash-dir) move_to_trash "$2" ;;
+    trash-old:*) move_to_trash ${(0)"$(old_files "$1" "$2")"} ;;
+  esac
+  return 0
+}
+
+goes_to_trash() { [[ $1 == trash-* ]]; }
+
+# ─── tips for big folders ────────────────────────────────────────────────────
+
+tip() {
+  case $1 in
+    */Crashpad*)                 print "Crash reports — junk. spacekeeper clean" ;;
+    *"Adobe Camera Raw"*)        print "Lightroom cache. Lightroom → Settings → Performance: move it to an external drive and cap its size" ;;
+    */Application\ Support/Google/Chrome|*/Application\ Support/Google) print "Chrome profiles (bookmarks, logins). Delete unused profiles from Chrome itself" ;;
+    */Caches/Google*)            print "Chrome cache — spacekeeper clean (with Chrome closed)" ;;
+    */.lmstudio*|*/.ollama*|*huggingface*) print "Local AI models. Delete the ones you don't use or move them to an external drive in the app" ;;
+    */.codex)                    print "Codex: conversation history (sessions) and plugins. Archive old sessions" ;;
+    */Application\ Support/Codex) print "Codex app. If it's big, check the Crashpad folder inside it" ;;
+    */Documents/Codex)           print "Work folders Codex creates per day for tasks without a project" ;;
+    */Claude/vm_bundles|*/Application\ Support/Claude) print "Claude Desktop (includes the Cowork virtual machine)" ;;
+    */.claude)                   print "Claude Code: session history and projects" ;;
+    */Movies/.gallery)           print "DaVinci Resolve gallery stills. spacekeeper move them to an external drive" ;;
+    */CacheClip*)                print "DaVinci render cache. In Resolve: Playback → Delete Render Cache" ;;
+    */Blackmagic\ Design)        print "DaVinci Resolve (project databases, LUTs)" ;;
+    */MobileSync*)               print "iPhone/iPad backups. Finder → your iPhone → Manage Backups" ;;
+    */Developer/CoreSimulator)   print "iOS simulators. xcrun simctl delete unavailable" ;;
+    */Developer/Xcode)           print "Xcode (DerivedData, iOS files). spacekeeper clean clears DerivedData" ;;
+    *[Dd]ocker*)                 print "Docker. docker system prune removes old images" ;;
+    */Steam)                     print "Steam games. Uninstall or move the library from the app" ;;
+    */Downloads)                 print "Downloads. Delete old installers (.dmg, .zip, .pkg)" ;;
+    */Desktop)                   print "Desktop. Screenshots tend to pile up here" ;;
+    */.npm|*/.cache|*/pnpm|*/Caches/pip) print "Developer cache — spacekeeper clean" ;;
+    */Library/Logs)              print "Logs — spacekeeper clean deletes the old ones" ;;
+    */Library/Containers)        print "App Store app data. See which app is heavy in Settings → Storage" ;;
+    *WhatsApp*|*Telegram*)       print "Chat media. Clean it up from the app itself (Storage)" ;;
+    */Caches/*)                  print "App cache — usually safe to delete with the app closed" ;;
+    */Pictures/*.photoslibrary)  print "Photos. Turn on 'Optimize Mac Storage' in the Photos app" ;;
+    */Music/*)                   print "Downloaded music/podcasts" ;;
+  esac
+}
+
+# ─── commands ────────────────────────────────────────────────────────────────
+
+cmd_status() {
+  local free=$(free_kb) total=$(total_kb) goal=$(( $(gb_kb $GOAL_GB) ))
+  print -r -- "${B}SpaceKeeper${N} ${D}$VERSION${N}"
+  print -r -- ""
+  printf "  Free space: %s%s%s of %s\n" "$B" "$(human $free)" "$N" "$(human $total)"
+  printf "  %s\n" "$(bar $(( total - free )) $total)"
+  if (( free >= goal )); then
+    printf "  Goal: %s GB free  %s✓ on track%s (%s to spare)\n" "$GOAL_GB" "$G" "$N" "$(human $(( free - goal )))"
+  else
+    printf "  Goal: %s GB free  %s✗ %s short%s → spacekeeper scan\n" "$GOAL_GB" "$R" "$(human $(( goal - free )))" "$N"
+  fi
+  print -r -- ""
+  if watching; then
+    print -r -- "  Watcher: ${G}on${N} (every ${INTERVAL_HOURS}h)"
+  else
+    print -r -- "  Watcher: ${Y}off${N} → spacekeeper watch on"
+  fi
+  print -r -- "  Auto-clean below goal: $AUTO_CLEAN  ${D}(spacekeeper config auto-clean yes|no)${N}"
+  print -r -- ""
+  print -r -- "  ${D}spacekeeper help — lists every command${N}"
+}
+
+cmd_clean() {
+  local run=0 yes=0 quiet=0 a
+  for a; do
+    case $a in
+      --run)      run=1 ;;
+      --yes|-y)   yes=1 ;;
+      --quiet)    quiet=1 ;;
+      *) die "unknown option: $a" ;;
+    esac
+  done
+
+  local -a queue
+  local total=0 type desc loc busy t
+  while IFS='|' read -r t desc busy type loc; do
+    if (( busy )); then
+      (( quiet )) || printf "  %s%-9s%s %s %s(close the app to clean it)%s\n" "$D" "$(human $t)" "$N" "$desc" "$Y" "$N"
+      continue
+    fi
+    queue+=("$type|$loc|$desc|$t")
+    (( total += t ))
+    (( quiet )) || printf "  %s%-9s%s %s\n" "$B" "$(human $t)" "$N" "$desc"
+  done < <(list_junk)
+
+  FREED_KB=0
+  if (( ${#queue} == 0 )); then
+    (( quiet )) || print -r -- "  ${G}Nothing to clean right now.${N}"
+    return 0
+  fi
+  (( quiet )) || print -r -- "  ${B}Total: $(human $total)${N}"
+
+  if (( ! run )); then
+    print -r -- "  ${D}Preview — nothing was deleted. To delete: ${N}${C}spacekeeper clean --run${N}"
+    return 0
+  fi
+  if (( ! yes )) && ! confirm "Delete $(human $total) of safe junk?"; then
+    print -r -- "Cancelled."
+    return 0
+  fi
+
+  local before=$(free_kb) item
+  for item in $queue; do
+    IFS='|' read -r type loc desc t <<< "$item"
+    delete_target $type "$loc"
+    log "cleaned: $desc ($(human $t))"
+  done
+  FREED_KB=$total
+  (( quiet )) || print -r -- "  ${G}✓ Clean.${N} Free now: $(human $(free_kb)) (was $(human $before))"
+}
+
+# ─── collection (field|field lines, used by the terminal and the app) ────────
+
+# kb|description|busy(0/1)|type|loc|who is using it
+list_junk() {
+  local type desc loc cond t who
+  while IFS='|' read -r type desc loc cond; do
+    [[ -d $loc ]] || continue
+    t=$(measure $type "$loc")
+    (( t < 1024 )) && continue
+    who=$(in_use_by "$type" "$loc" "$cond")
+    print -r -- "$t|$desc|${${who:+1}:-0}|$type|$loc|$who"
+  done < <(safe_targets)
+}
+
+id_of() { md5 -qs "$1|$2" | cut -c1-8; }
+
+# id|tier|kb|in use by|description|note|type|loc — everything the full scan finds
+list_scan() {
+  local tier type desc loc cond note t
+  while IFS='|' read -r tier type desc loc cond note; do
+    [[ -e $loc ]] || continue
+    t=$(measure "$type" "$loc")
+    (( t < 5120 )) && continue
+    print -r -- "$(id_of "$type" "$loc")|$tier|$t|$(in_use_by "$type" "$loc" "$cond")|$desc|$note|$type|$loc"
+  done < <(targets) | sort -t'|' -k2,2r -k3,3nr
+}
+
+# n|kb|app|folder — only apps above the crash limit
+list_crashes() {
+  local c n
+  for c in ${(f)"$(crashpads)"}; do
+    n=$(find "$c" -type f 2>/dev/null | wc -l | tr -d ' ')
+    (( n > CRASH_LIMIT )) && print -r -- "$n|$(kb "$c")|${c:h:t}|$c"
+  done
+}
+
+# kind(reopens|error)|label|app or exit code|program
+list_tasks() {
+  local list disabled f label line pid st prog ka
+  list=$(launchctl list 2>/dev/null)
+  disabled=$(launchctl print-disabled "gui/$UID" 2>/dev/null)
+  for f in "$HOME/Library/LaunchAgents"/*.plist(N); do
+    label=$(/usr/libexec/PlistBuddy -c 'Print :Label' "$f" 2>/dev/null) || continue
+    print -r -- "$disabled" | grep -qF "\"$label\" => disabled" && continue
+    print -r -- "$disabled" | grep -qF "\"$label\" => true" && continue
+    line=$(print -r -- "$list" | awk -v l="$label" '$3==l')
+    [[ -z $line ]] && continue
+    pid=${${=line}[1]} st=${${=line}[2]}
+    prog=$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$f" 2>/dev/null ||
+           /usr/libexec/PlistBuddy -c 'Print :Program' "$f" 2>/dev/null)
+    ka=$(/usr/libexec/PlistBuddy -c 'Print :KeepAlive' "$f" 2>/dev/null)
+    if [[ $prog == *.app/Contents/MacOS/* && -n $ka && $ka != false ]]; then
+      print -r -- "reopens|$label|${${prog%%.app/*}:t}|$prog"
+    elif [[ $pid == - && $st != 0 ]]; then
+      print -r -- "error|$label|$st|$prog"
+    fi
+  done
+}
+
+# app|port|profile
+list_remote() {
+  local l exe port profile
+  ps -axo command= | grep -E -- '--remote-debugging-port=[0-9]+' | grep -v -- '--type=' | grep -v grep |
+  while read -r l; do
+    exe=${${l%%.app/*}:t}
+    port=${l##*--remote-debugging-port=}; port=${port%% *}
+    profile=""
+    [[ $l == *--user-data-dir=* ]] && profile=${${l##*--user-data-dir=}%% --*}
+    print -r -- "$exe|$port|$profile"
+  done
+}
+
+# kb|loc — the N biggest folders
+list_biggest() {
+  local -a cands
+  cands=(
+    "$HOME/Library/Application Support"/*(N/)
+    "$HOME/Library/Caches"/*(N/)
+    "$HOME/Library/Group Containers"/*(N/)
+    "$HOME/Library/Developer"/*(N/)
+    "$HOME/Library/Containers" "$HOME/Library/Logs"
+    "$HOME"/.*(N/)
+    "$HOME/Movies"/*(N/) "$HOME/Movies"/.*(N/)
+    "$HOME/Documents"/*(N/) "$HOME/Documents"/.*(N/)
+    "$HOME/Pictures"/*(N/) "$HOME/Music"/*(N/)
+    "$HOME/Downloads" "$HOME/Desktop"
+  )
+  local p t
+  for p in $cands; do
+    [[ ${p:t} == .Trash ]] && continue
+    t=$(limited 30 kb "$p")
+    (( t >= 524288 )) && print -r -- "$t|$p"
+  done | sort -t'|' -k1,1nr | head -n ${1:-15}
+}
+
+hidden() { [[ ${1#$HOME} == */.* ]]; }
+
+# ─── terminal reports ────────────────────────────────────────────────────────
+
+biggest() {
+  local t p d mark
+  list_biggest ${1:-15} | while IFS='|' read -r t p; do
+    mark=""
+    hidden "$p" && mark=" ${Y}(hidden in Finder)${N}"
+    printf "  %s%-9s%s %s%s\n" "$B" "$(human $t)" "$N" "$(short "$p")" "$mark"
+    d=$(tip "$p")
+    [[ -n $d ]] && print -r -- "            ${D}↳ $d${N}"
+  done
+}
+
+tasks() {
+  local found=0 kind label info prog
+  while IFS='|' read -r kind label info prog; do
+    found=1
+    if [[ $kind == reopens ]]; then
+      print -r -- "  ${Y}⚠${N} ${B}$label${N} opens ${B}$info${N} by itself and ${Y}reopens it if you quit${N}"
+      print -r -- "            ${D}↳ If you don't recognize it: spacekeeper pause-task $label${N}"
+    else
+      print -r -- "  ${R}✗${N} ${B}$label${N} keeps exiting with an error (code $info)"
+      print -r -- "            ${D}↳ $(short "$prog")${N}"
+      print -r -- "            ${D}↳ If you no longer use it: spacekeeper pause-task $label${N}"
+    fi
+  done < <(list_tasks)
+  (( found )) || print -r -- "  ${G}No problematic tasks.${N}"
+}
+
+remote_control() {
+  local found=0 exe port profile
+  while IFS='|' read -r exe port profile; do
+    found=1
+    print -r -- "  ${Y}⚠${N} ${B}$exe${N} has remote control enabled (port $port)"
+    [[ -n $profile ]] && print -r -- "            ${D}↳ profile: $(short "$profile")${N}"
+    print -r -- "            ${D}↳ Any program on this Mac can drive that browser. If it isn't your own automation, quit it.${N}"
+  done < <(list_remote)
+  (( found )) || print -r -- "  ${G}No browser is being remote-controlled.${N}"
+}
+
+crash_storms() {
+  local found=0 n t app c
+  while IFS='|' read -r n t app c; do
+    found=1
+    print -r -- "  ${R}✗${N} ${B}$app${N} created ${B}$n${N} crash reports ($(human $t))"
+    print -r -- "            ${D}↳ The app is crashing in a loop. Clean up and restart/update it.${N}"
+  done < <(list_crashes)
+  (( found )) || print -r -- "  ${G}No app is crash-looping.${N}"
+}
+
+# change in free space over 7 days (KB); empty if there's no history
+trend_kb() {
+  [[ -f $HIST ]] || return 0
+  local ref
+  ref=$(awk -F, -v t=$(( $(date +%s) - 7*86400 )) '$1>=t {print $2; exit}' "$HIST")
+  [[ -n $ref ]] && print $(( $(free_kb) - ref ))
+}
+
+trend() {
+  local diff=$(trend_kb)
+  [[ -z $diff ]] && return 0
+  if (( diff < -1048576 )); then
+    print -r -- "  ${Y}Last 7 days: you lost $(human $diff) of free space${N}"
+  elif (( diff > 1048576 )); then
+    print -r -- "  ${G}Last 7 days: you gained $(human $diff) of free space${N}"
+  fi
+}
+
+cmd_analyze() {
+  record
+  cmd_status
+  trend
+
+  heading "1. Safe junk (rebuilds itself)"
+  cmd_clean
+
+  heading "2. Crash-looping apps"
+  crash_storms
+
+  heading "3. Biggest folders to review ${D}(measuring… may take a minute)${N}"
+  biggest 15
+
+  heading "4. Background tasks"
+  tasks
+
+  heading "5. Remote-controlled browsers"
+  remote_control
+
+  local trash snaps
+  trash=$(kb "$HOME/.Trash")
+  snaps=$(tmutil listlocalsnapshots / 2>/dev/null | grep -c 'com.apple')
+  if (( trash > 102400 || snaps > 0 )); then
+    heading "6. Other"
+    (( trash > 102400 )) && print -r -- "  Trash holds ${B}$(human $trash)${N} — empty it in Finder"
+    (( snaps > 0 )) && print -r -- "  $snaps local Time Machine snapshot(s) ${D}(macOS deletes them by itself when it needs space)${N}"
+  fi
+  print -r -- ""
+}
+
+record() {
+  mkdir -p "$CONF_DIR"
+  print -r -- "$(date +%s),$(free_kb)" >> "$HIST"
+  # keep only the last ~60 days (every 3h ≈ 500 lines)
+  if (( $(wc -l < "$HIST") > 1000 )); then
+    tail -n 500 "$HIST" > "$HIST.tmp" && mv "$HIST.tmp" "$HIST"
+  fi
+}
+
+cmd_watch_run() {
+  record
+  local free=$(free_kb) goal=$(( $(gb_kb $GOAL_GB) )) c n size s
+
+  # 1) crash storm — the problem that fills a disk in a few days
+  for c in ${(f)"$(crashpads)"}; do
+    n=$(find "$c" -type f 2>/dev/null | wc -l | tr -d ' ')
+    (( n > CRASH_LIMIT )) || continue
+    size=$(kb "$c")
+    if [[ $CLEAN_CRASHES == yes ]]; then
+      for s in pending completed new; do [[ -d $c/$s ]] && find "$c/$s" -mindepth 1 -delete 2>/dev/null; done
+      log "crash storm: ${c:h:t} — deleted $n reports ($(human $size))"
+      notify "${c:h:t} keeps crashing" "Deleted $n crash reports ($(human $size)). Consider restarting or updating the app."
+    else
+      log "crash storm: ${c:h:t} — $n reports ($(human $size))"
+      notify "${c:h:t} keeps crashing" "$n crash reports ($(human $size)). Run: spacekeeper clean"
+    fi
+  done
+  free=$(free_kb)
+
+  # 2) fast drop — something new is filling the disk
+  local peak drop
+  peak=$(awk -F, -v t=$(( $(date +%s) - 86400 )) '$1>=t && $2>m {m=$2} END{print m+0}' "$HIST")
+  drop=$(( peak - free ))
+  if (( drop > $(gb_kb $DROP_ALERT_GB) )) && can_notify drop 43200; then
+    log "fast drop: -$(human $drop) in 24h"
+    notify "Your disk is filling up fast" "You lost $(human $drop) in the last 24h. Run: spacekeeper analyze"
+  fi
+
+  # 3) new version (checked at most once a day)
+  if can_notify version 86400; then
+    local latest=$(latest_version)
+    is_newer "$latest" "$VERSION" && notify "SpaceKeeper $latest is out" "Open the app and click Update, or run: spacekeeper update"
+  fi
+
+  # 4) free-space goal
+  if (( free < goal )); then
+    if [[ $AUTO_CLEAN == yes ]]; then
+      cmd_clean --run --yes --quiet
+      free=$(free_kb)
+      (( FREED_KB > 0 )) && notify "Auto-clean" "Freed $(human $FREED_KB). Now: $(human $free) free."
+    fi
+    if (( free < goal )) && can_notify goal 21600; then
+      log "below goal: $(human $free) free (goal $GOAL_GB GB)"
+      notify "Low on space: $(human $free) free" "Your goal is $GOAL_GB GB. Run: spacekeeper scan"
+    fi
+  fi
+}
+
+save_config() {
+  mkdir -p "$CONF_DIR"
+  cat > "$CONF" <<EOF
+# spacekeeper — settings (edit freely or use: spacekeeper config)
+GOAL_GB=$GOAL_GB
+AUTO_CLEAN=$AUTO_CLEAN
+CLEAN_CRASHES=$CLEAN_CRASHES
+INTERVAL_HOURS=$INTERVAL_HOURS
+LOG_DAYS=$LOG_DAYS
+DROP_ALERT_GB=$DROP_ALERT_GB
+CRASH_LIMIT=$CRASH_LIMIT
+EOF
+}
+
+cmd_config() {
+  if (( $# == 0 )); then
+    print -r -- "${B}Settings${N} ${D}($(short "$CONF"))${N}"
+    print -r -- "  goal            $GOAL_GB GB      minimum free space"
+    print -r -- "  auto-clean      $AUTO_CLEAN        clean safe junk automatically below the goal"
+    print -r -- "  clean-crashes   $CLEAN_CRASHES       delete crash storms automatically"
+    print -r -- "  interval        ${INTERVAL_HOURS}h        how often to check"
+    print -r -- "  log-days        $LOG_DAYS          age at which a log becomes junk"
+    print -r -- "  drop-alert      $DROP_ALERT_GB GB      alert if you lose this much in 24h"
+    print -r -- ""
+    print -r -- "  ${D}e.g. spacekeeper config goal 30${N}"
+    return 0
+  fi
+  local key=$1 value=$2
+  case $key in
+    goal)          [[ $value == <1-> ]] || die "usage: spacekeeper config goal 30"; GOAL_GB=$value ;;
+    auto-clean)    [[ $value == (yes|no) ]] || die "use: yes or no"; AUTO_CLEAN=$value ;;
+    clean-crashes) [[ $value == (yes|no) ]] || die "use: yes or no"; CLEAN_CRASHES=$value ;;
+    interval)      [[ $value == <1-24> ]] || die "use a number of hours (1 to 24)"; INTERVAL_HOURS=$value ;;
+    log-days)      [[ $value == <1-> ]] || die "use a number of days"; LOG_DAYS=$value ;;
+    drop-alert)    [[ $value == <1-> ]] || die "use a number of GB"; DROP_ALERT_GB=$value ;;
+    *) die "unknown setting: $key (see: spacekeeper config)" ;;
+  esac
+  save_config
+  print -r -- "${G}✓${N} $key = $value"
+  [[ $key == interval ]] && watching && cmd_watch_on
+  return 0
+}
+
+cmd_watch_on() {
+  [[ -f $CONF ]] || save_config
+  mkdir -p "${PLIST:h}"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array><string>$SCRIPT</string><string>watch</string><string>run</string></array>
+  <key>StartInterval</key><integer>$(( INTERVAL_HOURS * 3600 ))</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+</dict></plist>
+EOF
+  launchctl bootout "gui/$UID/$LABEL" 2>/dev/null
+  launchctl enable "gui/$UID/$LABEL" 2>/dev/null
+  launchctl bootstrap "gui/$UID" "$PLIST" || die "couldn't turn the watcher on"
+  print -r -- "${G}✓${N} Watcher on: checks the disk every ${INTERVAL_HOURS}h and alerts you below $GOAL_GB GB free."
+}
+
+cmd_watch_off() {
+  launchctl bootout "gui/$UID/$LABEL" 2>/dev/null
+  rm -f "$PLIST"
+  print -r -- "${G}✓${N} Watcher off."
+}
+
+cmd_watch() {
+  case $1 in
+    on)  cmd_watch_on ;;
+    off) cmd_watch_off ;;
+    run) cmd_watch_run ;;
+    *)   die "usage: spacekeeper watch on|off" ;;
+  esac
+}
+
+task_plist() {
+  local f
+  for f in "$HOME/Library/LaunchAgents"/*.plist(N); do
+    [[ $(/usr/libexec/PlistBuddy -c 'Print :Label' "$f" 2>/dev/null) == $1 ]] && { print -r -- "$f"; return 0; }
+  done
+  return 1
+}
+
+cmd_pause_task() {
+  [[ -n $1 ]] || die "usage: spacekeeper pause-task <task-label>"
+  task_plist "$1" >/dev/null || die "couldn't find task $1 in ~/Library/LaunchAgents"
+  launchctl bootout "gui/$UID/$1" 2>/dev/null
+  launchctl disable "gui/$UID/$1"
+  log "paused task: $1"
+  print -r -- "${G}✓${N} $1 stopped and won't come back after a restart. To turn it back on: spacekeeper resume-task $1"
+}
+
+cmd_resume_task() {
+  [[ -n $1 ]] || die "usage: spacekeeper resume-task <task-label>"
+  local f
+  f=$(task_plist "$1") || die "couldn't find task $1 in ~/Library/LaunchAgents"
+  launchctl enable "gui/$UID/$1"
+  launchctl bootstrap "gui/$UID" "$f" 2>/dev/null
+  log "resumed task: $1"
+  print -r -- "${G}✓${N} $1 is back on."
+}
+
+count_files() { find "$1" -type f ! -name .DS_Store ! -name '._*' 2>/dev/null | wc -l | tr -d ' '; }
+count_bytes() { find "$1" -type f ! -name .DS_Store ! -name '._*' -print0 2>/dev/null | xargs -0 stat -f%z 2>/dev/null | awk '{s+=$1} END{printf "%d\n", s}'; }
+
+cmd_move() {
+  (( $# == 2 )) || die "usage: spacekeeper move <folder> <destination-folder-on-external-drive>"
+  local input=${1%/}
+  [[ -L $input ]] && die "$input is already a link — it was already moved"
+  [[ -d $input ]] || die "folder not found: $input"
+  [[ -d $2 ]] || die "destination doesn't exist: $2 (is the drive connected?)"
+  local src=${input:A} dest=${2:A}
+  [[ $src == $HOME/* ]] || die "for safety, I only move folders inside $(short $HOME)"
+  [[ $dest == $src || $dest == $src/* ]] && die "the destination can't be inside the folder itself"
+
+  local name=${src:t}
+  local final="$dest/${name#.}"
+  [[ -e $final ]] && die "$final already exists"
+
+  local size=$(kb "$src") dest_free
+  dest_free=$(df -k "$dest" | awk 'NR==2{print $4}')
+  (( dest_free > size + 1048576 )) || die "not enough space at the destination ($(human $dest_free) free, need $(human $size))"
+
+  print -r -- "${B}Move $(human $size)${N}"
+  print -r -- "  from: $(short "$src")"
+  print -r -- "  to:   $final"
+  print -r -- "  A link stays in its place — apps keep finding the files."
+  print -r -- "  ${Y}Quit the apps that use this folder before continuing.${N}"
+  print -r -- "  ${Y}Afterwards, keep the drive connected when you use these files.${N}"
+  confirm "Continue?" || { print -r -- "Cancelled."; return 0; }
+
+  print -r -- "Copying…"
+  mkdir -p "$final" || die "couldn't create $final"
+  rsync -rt "$src/" "$final/" || die "the copy failed — nothing was deleted from the Mac"
+
+  local n1 n2 b1 b2
+  n1=$(count_files "$src") n2=$(count_files "$final")
+  b1=$(count_bytes "$src") b2=$(count_bytes "$final")
+  if [[ $n1 != $n2 || $b1 != $b2 ]]; then
+    die "the copy didn't match ($n1 vs $n2 files) — nothing was deleted from the Mac. Partial copy at: $final"
+  fi
+  print -r -- "  ${G}✓${N} Copy verified: $n2 files, $(human $(( b2 / 1024 )))"
+
+  rm -rf "$src" && ln -s "$final" "$src" || die "copied, but couldn't replace the folder with a link"
+  log "moved: $src → $final ($(human $size))"
+  print -r -- "  ${G}✓${N} Done. Free now: $(human $(free_kb))"
+}
+
+# ─── full scan (first run and on demand) ─────────────────────────────────────
+
+SCAN_CACHE="$CONF_DIR/scan.cache"
+
+first_scan_done() { grep -q '^first_scan=' "$STATE" 2>/dev/null; }
+mark_first_scan() { mkdir -p "$CONF_DIR"; first_scan_done || print -r -- "first_scan=$(date +%s)" >> "$STATE"; }
+
+# scan lines: reuses a measurement from the last 15 min if there is one (measuring everything takes ~30 s)
+scan_lines() {
+  if [[ -f $SCAN_CACHE && $1 != --fresh ]] && (( $(date +%s) - $(stat -f %m "$SCAN_CACHE") < 900 )); then
+    cat "$SCAN_CACHE"
+  else
+    mkdir -p "$CONF_DIR"
+    list_scan | tee "$SCAN_CACHE"
+  fi
+}
+
+# Cleans the given lines (list_scan format). Checks again that the app wasn't
+# opened in the meantime. Sets FREED_KB, TRASHED_KB, CLEANED and SKIPPED.
+clean_lines() {
+  local l id tier t who desc note type loc cond
+  FREED_KB=0 TRASHED_KB=0 CLEANED=0 SKIPPED=()
+  for l in "$@"; do
+    IFS='|' read -r id tier t who desc note type loc <<< "$l"
+    [[ -e $loc ]] || continue
+    cond=$(targets | awk -F'|' -v c="$loc" -v t="$type" '$4==c && $2==t {print $5; exit}')
+    who=$(in_use_by "$type" "$loc" "$cond")
+    if [[ -n $who ]]; then SKIPPED+=("$desc|$who"); continue; fi
+    delete_target "$type" "$loc"
+    if goes_to_trash "$type"; then (( TRASHED_KB += t )); else (( FREED_KB += t )); fi
+    (( CLEANED++ ))
+    log "scan: $desc ($(human $t))$(goes_to_trash "$type" && print ' → Trash')"
+  done
+  rm -f "$SCAN_CACHE"
+  mark_first_scan
+}
+
+celebrate() {   # $1 = free space before (KB)
+  local now=$(free_kb)
+  print -r -- ""
+  print -r -- "  ${G}════════════════════════════════════════════════════${N}"
+  if (( FREED_KB > 0 )); then
+    print -r -- "   🎉  ${B}You freed $(human $FREED_KB) that was hiding on your Mac!${N}"
+  else
+    print -r -- "   ✅  ${B}Done!${N}"
+  fi
+  print -r -- "       Before: $(human $1) free  →  Now: ${B}$(human $now) free${N}"
+  if (( TRASHED_KB > 0 )); then
+    print -r -- ""
+    print -r -- "   🗑️   Another ${B}$(human $TRASHED_KB)${N} went to the Trash (still recoverable)."
+    print -r -- "       To free it for good: ${C}spacekeeper empty-trash${N}"
+  fi
+  local p
+  for p in $SKIPPED; do
+    print -r -- "   ${Y}⚠${N}  Skipped ${p%%|*}: ${p##*|} was open."
+  done
+  print -r -- "  ${G}════════════════════════════════════════════════════${N}"
+  (( FREED_KB > 0 )) && notify "SpaceKeeper" "You freed $(human $FREED_KB). Now: $(human $now) free."
+}
+
+cmd_scan() {
+  if [[ $1 == --skip ]]; then mark_first_scan; print -r -- "${G}✓${N} Ok, I won't ask again."; return 0; fi
+
+  print -r -- ""
+  print -r -- "${B}🔎 Full scan of your Mac${N}"
+  print -r -- "   Looking for hidden space… ${D}(about 30 seconds)${N}"
+  local -a lines marked
+  lines=(${(f)"$(scan_lines --fresh)"})
+  if (( ${#lines} == 0 )); then
+    print -r -- "   ${G}Your Mac is already clean 👌${N}"
+    mark_first_scan
+    return 0
+  fi
+
+  local i id tier t who desc note type loc
+  for (( i = 1; i <= ${#lines}; i++ )); do
+    IFS='|' read -r id tier t who desc note type loc <<< "$lines[i]"
+    [[ $tier == safe && -z $who ]] && marked[i]=1 || marked[i]=0
+  done
+
+  _show() {
+    local group="" sel=0 tot=0 box
+    print -r -- ""
+    for (( i = 1; i <= ${#lines}; i++ )); do
+      IFS='|' read -r id tier t who desc note type loc <<< "$lines[i]"
+      if [[ $tier != $group ]]; then
+        group=$tier
+        [[ $tier == safe ]] && print -r -- "  ${B}SAFE${N} ${D}— rebuilds itself, you lose nothing${N}" \
+                            || { print -r -- ""; print -r -- "  ${B}REVIEW${N} ${D}— yours: only removed if you pick it${N}"; }
+      fi
+      (( tot += t ))
+      if (( marked[i] )); then box="${G}[✓]${N}"; (( sel += t )); else box="[ ]"; fi
+      printf "   %s %2d  %s%9s%s  %s\n" "$box" $i "$B" "$(human $t)" "$N" "$desc"
+      [[ -n $note ]] && print -r -- "                    ${D}↳ $note${N}"
+      [[ -n $who ]] && print -r -- "                    ${Y}⚠ quit $who to clean this${N}"
+    done
+    print -r -- ""
+    print -r -- "  Found ${B}$(human $tot)${N} · Selected: ${G}${B}$(human $sel)${N}"
+  }
+
+  if [[ ! -t 0 ]]; then
+    _show
+    print -r -- ""
+    print -r -- "  To clean, run in Terminal: spacekeeper scan"
+    print -r -- "  (or, from an AI assistant: spacekeeper data scan  →  spacekeeper clean-items <ids>)"
+    return 0
+  fi
+
+  local r n
+  while true; do
+    _show
+    print -r -- ""
+    print -r -- "  ${D}Numbers to select/unselect (e.g. 3 7) · a = select all safe · r = re-check after quitting apps${N}"
+    # no answer (closed input, Ctrl+D) = quit without cleaning. Never cleans by default.
+    if ! read -r "r?  ${B}Enter${N} to clean what's selected · ${B}q${N} to quit without cleaning: "; then
+      print -r -- ""; print -r -- "  Nothing was deleted."
+      return 0
+    fi
+    case $r in
+      "") break ;;
+      q|Q) print -r -- "  Nothing was deleted."; mark_first_scan; return 0 ;;
+      a|A) for (( i = 1; i <= ${#lines}; i++ )); do
+             IFS='|' read -r id tier t who desc note type loc <<< "$lines[i]"
+             [[ $tier == safe && -z $who ]] && marked[i]=1
+           done ;;
+      r|R) print -r -- "  Re-checking…"
+           lines=(${(f)"$(scan_lines --fresh)"}) ;;
+      *) for n in ${=r}; do
+           [[ $n == <-> ]] && (( n >= 1 && n <= ${#lines} )) || continue
+           IFS='|' read -r id tier t who desc note type loc <<< "$lines[n]"
+           if [[ -n $who ]]; then
+             print -r -- "  ${Y}⚠ Quit $who first, then type r so I can re-check.${N}"
+             continue
+           fi
+           (( marked[n] = !marked[n] ))
+         done ;;
+    esac
+  done
+
+  local -a chosen
+  for (( i = 1; i <= ${#lines}; i++ )); do (( marked[i] )) && chosen+=("$lines[i]"); done
+  if (( ${#chosen} == 0 )); then
+    print -r -- "  Nothing selected. Nothing was deleted."
+    mark_first_scan
+    return 0
+  fi
+
+  local total=0 l2
+  for l2 in $chosen; do (( total += ${${l2#*|*|}%%|*} )); done
+  print -r -- ""
+  if ! confirm "  Clean $(human $total) (${#chosen} items)?"; then
+    print -r -- "  Nothing was deleted."
+    return 0
+  fi
+
+  local before=$(free_kb)
+  print -r -- "  Cleaning…"
+  clean_lines "${chosen[@]}"
+  celebrate $before
+}
+
+# Used by the app and by AI assistants: cleans only the chosen ids
+cmd_clean_items() {
+  local json=0 a
+  local -A want
+  for a; do
+    case $a in
+      --json) json=1 ;;
+      *) want[$a]=1 ;;
+    esac
+  done
+  (( ${#want} )) || die "usage: spacekeeper clean-items <id> [<id>…] [--json]  (ids from: spacekeeper data scan)"
+
+  local -a chosen
+  local l
+  for l in ${(f)"$(scan_lines)"}; do
+    (( ${+want[${l%%|*}]} )) && chosen+=("$l")
+  done
+  local before=$(free_kb)
+  clean_lines "${chosen[@]}"
+
+  if (( json )); then
+    local p sep=
+    print -rn -- "{\"freed_kb\":$FREED_KB,\"trashed_kb\":$TRASHED_KB,\"items\":$CLEANED,\"free_before\":$before,\"free_after\":$(free_kb),\"skipped\":["
+    for p in $SKIPPED; do
+      print -rn -- "$sep{\"desc\":$(js "${p%%|*}"),\"in_use_by\":$(js "${p##*|}")}"; sep=,
+    done
+    print -r -- "]}"
+  else
+    celebrate $before
+  fi
+}
+
+cmd_empty_trash() {
+  if [[ $1 != --yes ]]; then
+    confirm "Empty the Trash? This permanently deletes what's in it." || { print -r -- "Cancelled."; return 0; }
+  fi
+  local before=$(free_kb)
+  osascript -e 'tell application "Finder" to empty trash' >/dev/null 2>&1 || die "couldn't empty it (macOS may ask for permission to control Finder)"
+  log "emptied the Trash"
+  print -r -- "${G}✓${N} Trash emptied. Free now: $(human $(free_kb)) (was $(human $before))"
+}
+
+# ─── updates ─────────────────────────────────────────────────────────────────
+
+latest_version() {
+  curl -fsL --max-time 6 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null |
+    sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' | head -1
+}
+
+# true if $1 is a newer version than $2
+is_newer() {
+  [[ -n $1 && $1 != $2 ]] || return 1
+  [[ $(printf '%s\n%s\n' "$1" "$2" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1) == $1 ]]
+}
+
+cmd_update() {
+  local latest=$(latest_version)
+  [[ -n $latest ]] || die "couldn't check the latest version (are you offline?)"
+  if [[ $1 == --check ]]; then
+    is_newer "$latest" "$VERSION" && print -r -- "$latest"
+    return 0
+  fi
+  if ! is_newer "$latest" "$VERSION" && [[ $1 != --force ]]; then
+    print -r -- "${G}✓${N} You're on the latest version ($VERSION)."
+    return 0
+  fi
+  print -r -- "Updating SpaceKeeper $VERSION → $latest… ${D}(your settings stay as they are)${N}"
+  zsh -c "$(curl -fsSL https://raw.githubusercontent.com/$REPO/main/get.sh)" -- --yes --no-open || die "the update failed"
+  log "updated: $VERSION → $latest"
+  [[ -d "/Applications/SpaceKeeper.app" || -d "$HOME/Applications/SpaceKeeper.app" ]] && open -a "SpaceKeeper"
+  return 0
+}
+
+# ─── data for the app (JSON) ─────────────────────────────────────────────────
+
+js()   { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\t'/ }; print -rn -- "\"$s\""; }
+bool() { (( $1 )) && print -rn true || print -rn false; }
+
+cmd_data() {
+  local sep t desc b type loc n app c label info prog port profile p
+  case ${1:-summary} in
+    summary)
+      local tr=$(trend_kb) on=0 ac=0
+      watching && on=1
+      [[ $AUTO_CLEAN == yes ]] && ac=1
+      print -rn -- "{\"version\":\"$VERSION\",\"free\":$(free_kb),\"total\":$(total_kb),\"goal_kb\":$(gb_kb $GOAL_GB),\"goal_gb\":$GOAL_GB"
+      print -rn -- ",\"watching\":$(bool $on),\"auto_clean\":$(bool $ac),\"interval\":$INTERVAL_HOURS"
+      print -rn -- ",\"trend_kb\":${tr:-null},\"first_scan_done\":$(first_scan_done && print -n true || print -n false)"
+
+      print -rn -- ",\"junk\":["; sep=
+      while IFS='|' read -r t desc b type loc; do
+        print -rn -- "$sep{\"kb\":$t,\"desc\":$(js "$desc"),\"busy\":$(bool $b),\"path\":$(js "$loc")}"; sep=,
+      done < <(list_junk)
+
+      print -rn -- "],\"crashes\":["; sep=
+      while IFS='|' read -r n t app c; do
+        print -rn -- "$sep{\"n\":$n,\"kb\":$t,\"app\":$(js "$app"),\"path\":$(js "$c")}"; sep=,
+      done < <(list_crashes)
+
+      print -rn -- "],\"tasks\":["; sep=
+      while IFS='|' read -r type label info prog; do
+        print -rn -- "$sep{\"kind\":$(js "$type"),\"label\":$(js "$label"),\"info\":$(js "$info"),\"prog\":$(js "$prog")}"; sep=,
+      done < <(list_tasks)
+
+      print -rn -- "],\"remote\":["; sep=
+      while IFS='|' read -r app port profile; do
+        print -rn -- "$sep{\"app\":$(js "$app"),\"port\":$(js "$port"),\"profile\":$(js "$profile")}"; sep=,
+      done < <(list_remote)
+      print -r -- "]}"
+      ;;
+    folders)
+      print -rn -- "["; sep=
+      while IFS='|' read -r t p; do
+        hidden "$p" && b=1 || b=0
+        print -rn -- "$sep{\"kb\":$t,\"path\":$(js "$p"),\"hidden\":$(bool $b),\"tip\":$(js "$(tip "$p")")}"; sep=,
+      done < <(list_biggest 20)
+      print -r -- "]"
+      ;;
+    scan)
+      local id tier who note
+      print -rn -- "{\"free\":$(free_kb),\"items\":["; sep=
+      while IFS='|' read -r id tier t who desc note type loc; do
+        goes_to_trash "$type" && b=1 || b=0
+        print -rn -- "$sep{\"id\":$(js "$id"),\"tier\":$(js "$tier"),\"kb\":$t,\"in_use_by\":$(js "$who"),\"desc\":$(js "$desc"),\"note\":$(js "$note"),\"to_trash\":$(bool $b)}"; sep=,
+      done < <(scan_lines --fresh)
+      print -r -- "]}"
+      ;;
+    *) die "usage: spacekeeper data summary|folders|scan" ;;
+  esac
+}
+
+cmd_help() {
+  cat <<EOF
+${B}SpaceKeeper${N} — keeps your Mac's disk from filling up
+
+${B}Usage:${N}
+  spacekeeper                       summary: free space, goal and watcher
+  spacekeeper scan                  full scan: finds hidden space, you pick what to clean
+  spacekeeper analyze               full report: what's using space and why
+  spacekeeper clean                 shows safe junk (preview)
+  spacekeeper clean --run           deletes safe junk (asks first)
+  spacekeeper empty-trash           empties the Trash (asks first)
+  spacekeeper move <folder> <dest>  moves a folder to an external drive and leaves a link
+  spacekeeper update                installs the latest version (keeps your settings)
+
+  spacekeeper watch on|off          turns the automatic watcher on/off
+  spacekeeper config                shows/changes settings
+  spacekeeper config goal 30        minimum free space (GB)
+  spacekeeper config auto-clean yes cleans by itself when below the goal
+
+  spacekeeper pause-task <label>    stops a background task (reversible)
+  spacekeeper resume-task <label>   turns a paused task back on
+
+${B}What the watcher does${N} (every ${INTERVAL_HOURS}h):
+  • alerts you when free space falls below your goal
+  • alerts you when the disk loses more than ${DROP_ALERT_GB} GB in 24h
+  • detects crash-looping apps and deletes their reports
+  • if auto-clean = yes, cleans safe junk by itself
+
+History of what was deleted: $(short "$LOG")
+EOF
+}
+
+case ${1:-status} in
+  status)          cmd_status ;;
+  scan)            cmd_scan "$2" ;;
+  analyze|a)       cmd_analyze ;;
+  clean)           shift; cmd_clean "$@" ;;
+  clean-items)     shift; cmd_clean_items "$@" ;;
+  empty-trash)     cmd_empty_trash "$2" ;;
+  watch)           cmd_watch "$2" ;;
+  data)            cmd_data "$2" ;;
+  update)          cmd_update "$2" ;;
+  config)          shift; cmd_config "$@" ;;
+  move)            shift; cmd_move "$@" ;;
+  pause-task)      cmd_pause_task "$2" ;;
+  resume-task)     cmd_resume_task "$2" ;;
+  version|-v|--version) print -r -- "spacekeeper $VERSION" ;;
+  help|-h|--help)  cmd_help ;;
+  *) print -r -- "Unknown command: $1"; cmd_help; exit 1 ;;
+esac
