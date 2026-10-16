@@ -19,6 +19,10 @@ swiftc -O -swift-version 5 icon.swift -o "$TMP/icon"
 "$TMP/icon" "$TMP/AppIcon.iconset"
 iconutil -c icns "$TMP/AppIcon.iconset" -o "$APP/Contents/Resources/AppIcon.icns"
 
+# the tool and the skill ship inside the app (self-install for .dmg downloads)
+cp ../bin/spacekeeper "$APP/Contents/Resources/spacekeeper"
+cp -R ../skill/spacekeeper "$APP/Contents/Resources/skill-spacekeeper"
+
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

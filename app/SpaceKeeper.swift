@@ -9,8 +9,9 @@ import SwiftUI
 // MARK: - Command-line tool
 
 enum CLI {
-    static let path = NSHomeDirectory() + "/.local/bin/spacekeeper"
-    static let log = NSHomeDirectory() + "/Library/Logs/spacekeeper.log"
+    static let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+    static let path = home + "/.local/bin/spacekeeper"
+    static let log = home + "/Library/Logs/spacekeeper.log"
     static var installed: Bool { FileManager.default.isExecutableFile(atPath: path) }
 
     static func run(_ args: [String]) async -> String {
@@ -29,6 +30,63 @@ enum CLI {
                 cont.resume(returning: String(decoding: data, as: UTF8.self))
             }
         }
+    }
+}
+
+// MARK: - Self-install (for people who downloaded the .dmg and never opened Terminal)
+
+enum Installer {
+    static let home = CLI.home
+
+    /// "VERSION=\"1.1.0\"" → "1.1.0"
+    static func version(_ path: String) -> String? {
+        guard let txt = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+        for line in txt.split(separator: "\n").prefix(30) where line.hasPrefix("VERSION=") {
+            return line.dropFirst(8).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+        }
+        return nil
+    }
+
+    /// Installs or updates the tool bundled inside the app. On first run it also
+    /// turns on the watcher with the default goal (30 GB). Returns true if it installed now.
+    @discardableResult
+    static func ensure() async -> Bool {
+        let fm = FileManager.default
+        guard let bundled = Bundle.main.path(forResource: "spacekeeper", ofType: nil) else { return false }
+        let firstRun = !fm.fileExists(atPath: home + "/.config/spacekeeper/config")
+        let current = version(CLI.path)
+        if current != nil && current == version(bundled) && !firstRun { return false }
+
+        try? fm.createDirectory(atPath: home + "/.local/bin", withIntermediateDirectories: true)
+        try? fm.removeItem(atPath: CLI.path)
+        guard (try? fm.copyItem(atPath: bundled, toPath: CLI.path)) != nil else { return false }
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: CLI.path)
+
+        // skill for Claude Code / Codex, if the user has them
+        if let skill = Bundle.main.path(forResource: "skill-spacekeeper", ofType: nil) {
+            for dir in [".claude", ".codex"] where fm.fileExists(atPath: home + "/" + dir) {
+                let dest = home + "/" + dir + "/skills/spacekeeper"
+                try? fm.createDirectory(atPath: home + "/" + dir + "/skills", withIntermediateDirectories: true)
+                try? fm.removeItem(atPath: dest)
+                try? fm.copyItem(atPath: skill, toPath: dest)
+            }
+        }
+
+        // spacekeeper command in Terminal
+        let zshrc = home + "/.zshrc"
+        let current_zshrc = (try? String(contentsOfFile: zshrc, encoding: .utf8)) ?? ""
+        if !current_zshrc.contains(".local/bin") {
+            let line = "\n# spacekeeper\nexport PATH=\"$HOME/.local/bin:$PATH\"\n"
+            if let h = FileHandle(forWritingAtPath: zshrc) { h.seekToEndOfFile(); h.write(Data(line.utf8)); h.closeFile() }
+            else { try? line.write(toFile: zshrc, atomically: true, encoding: .utf8) }
+        }
+
+        if firstRun {
+            _ = await CLI.run(["config", "goal", "30"])
+            _ = await CLI.run(["config", "auto-clean", "no"])
+            _ = await CLI.run(["watch", "on"])
+        }
+        return true
     }
 }
 
@@ -1023,6 +1081,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }) { monitors.append(m) }
 
         Task {
+            await Installer.ensure()   // installed from the .dmg? the tool ships inside
             await state.refresh()
             // first run (or the installer asked for it): open by itself and run the full scan
             let welcome = CommandLine.arguments.contains("--welcome")

@@ -6,7 +6,7 @@ emulate -R zsh
 setopt NULL_GLOB
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin:$PATH"
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 REPO="Willclaf/spacekeeper"
 SCRIPT="${0:A}"
 CONF_DIR="${SPACEKEEPER_DIR:-$HOME/.config/spacekeeper}"

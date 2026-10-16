@@ -25,7 +25,14 @@ In one afternoon I got back **more than 35 GB** without deleting anything I care
 
 ## Install
 
-### The easy way: ask your AI assistant
+### The easiest way: download the installer (.dmg)
+
+1. Download **[SpaceKeeper.dmg](https://github.com/Willclaf/spacekeeper/releases/latest/download/SpaceKeeper.dmg)**
+2. Open it and **drag SpaceKeeper into Applications**
+3. Open SpaceKeeper. The first time, your Mac may say it couldn't verify the developer: go to **System Settings → Privacy & Security → Open Anyway** (on macOS 13/14: right-click the app → Open)
+4. That's it: it installs itself, shows up in your menu bar and immediately shows how much hidden space it found
+
+### Or ask your AI assistant
 
 Open Claude Code, Codex or Cursor and paste:
 
