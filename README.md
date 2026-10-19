@@ -156,9 +156,22 @@ The app shows a **⬆️** button when a new version is out, and the watcher sen
 
 ## Uninstall
 
+SpaceKeeper leaves a background "watcher" running (it checks your space every few hours). So **dragging the app to the Trash is not enough**: the watcher keeps running and macOS may keep asking for permissions. Pick one way:
+
+**1. From the app (easiest)**
+Menu bar icon › **Settings** › **Uninstall SpaceKeeper…**
+
+**2. From Terminal (works even if you already deleted the app)**
+Open **Terminal**, paste this line and press Enter:
+
 ```bash
-./uninstall.sh
+zsh -c "$(curl -fsSL https://raw.githubusercontent.com/Willclaf/spacekeeper/main/uninstall.sh)"
 ```
+
+It removes the app, the watcher, the `spacekeeper` command, the settings and the permissions macOS had stored. It doesn't undo anything it already cleaned.
+
+**3. I already deleted the app and the watcher stayed**
+From version 1.2.1 it notices the app is gone and removes itself on its next check (up to 3 hours). To skip the wait, use way 2.
 
 ---
 

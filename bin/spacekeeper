@@ -6,7 +6,7 @@ emulate -R zsh
 setopt NULL_GLOB
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin:$PATH"
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 REPO="Willclaf/spacekeeper"
 SCRIPT="${0:A}"
 CONF_DIR="${SPACEKEEPER_DIR:-$HOME/.config/spacekeeper}"
@@ -562,6 +562,7 @@ record() {
 }
 
 cmd_watch_run() {
+  if app_gone; then record; log "app removed: uninstalling the watcher"; cmd_uninstall >/dev/null; return 0; fi
   record
   local free=$(free_kb) goal=$(( $(gb_kb $GOAL_GB) )) c n size s
 
@@ -679,6 +680,26 @@ cmd_watch_off() {
   launchctl bootout "gui/$UID/$LABEL" 2>/dev/null
   rm -f "$PLIST"
   print -r -- "${G}✓${N} Watcher off."
+}
+
+# removes everything: watcher, command, skills, settings, permissions and the app
+cmd_uninstall() {
+  launchctl bootout "gui/$UID/$LABEL" 2>/dev/null
+  rm -f "$PLIST"
+  rm -f "$HOME/.local/bin/spacekeeper"
+  rm -rf "$HOME/.claude/skills/spacekeeper" "$HOME/.codex/skills/spacekeeper" "$CONF_DIR"
+  tccutil reset All com.spacekeeper.app >/dev/null 2>&1   # forget the permissions macOS had granted
+  [[ -z $SPACEKEEPER_FROM_APP ]] && pkill -x SpaceKeeper 2>/dev/null
+  rm -rf "/Applications/SpaceKeeper.app" "$HOME/Applications/SpaceKeeper.app"
+  print -r -- "${G}✓${N} SpaceKeeper removed. (History stays at $(short "$LOG"))"
+}
+
+# the app was deleted (dragged to the Trash) but the watcher stayed? It removes itself.
+app_gone() {
+  [[ -f $CONF_DIR/via-app ]] || return 1
+  [[ -d "/Applications/SpaceKeeper.app" || -d "$HOME/Applications/SpaceKeeper.app" ]] && return 1
+  [[ -n $(mdfind "kMDItemCFBundleIdentifier == 'com.spacekeeper.app'" 2>/dev/null | head -1) ]] && return 1
+  return 0
 }
 
 cmd_watch() {
@@ -1070,6 +1091,7 @@ ${B}Usage:${N}
   spacekeeper update                installs the latest version (keeps your settings)
 
   spacekeeper watch on|off          turns the automatic watcher on/off
+  spacekeeper uninstall             removes everything (app, watcher, command, settings)
   spacekeeper config                shows/changes settings
   spacekeeper config goal 30        minimum free space (GB)
   spacekeeper config auto-clean yes cleans by itself when below the goal
@@ -1095,6 +1117,7 @@ case ${1:-status} in
   clean-items)     shift; cmd_clean_items "$@" ;;
   empty-trash)     cmd_empty_trash "$2" ;;
   watch)           cmd_watch "$2" ;;
+  uninstall)       cmd_uninstall ;;
   data)            cmd_data "$2" ;;
   update)          cmd_update "$2" ;;
   config)          shift; cmd_config "$@" ;;

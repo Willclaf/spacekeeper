@@ -61,6 +61,9 @@ enum Installer {
         try? fm.removeItem(atPath: CLI.path)
         guard (try? fm.copyItem(atPath: bundled, toPath: CLI.path)) != nil else { return false }
         try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: CLI.path)
+        // marks that it came with the app: if the app goes away, the watcher uninstalls itself
+        try? fm.createDirectory(atPath: home + "/.config/spacekeeper", withIntermediateDirectories: true)
+        try? "1".write(toFile: home + "/.config/spacekeeper/via-app", atomically: true, encoding: .utf8)
 
         // skill for Claude Code / Codex, if the user has them
         if let skill = Bundle.main.path(forResource: "skill-spacekeeper", ofType: nil) {
@@ -267,6 +270,21 @@ final class AppState: ObservableObject {
         cleaning = false
         let gain = (summary?.free ?? 0) - before
         notice = gain > 102_400 ? "Done! Freed \(size(gain))." : "Done! Junk cleaned."
+    }
+
+    /// Asks and, if confirmed, removes the app, the watcher and the settings.
+    func confirmUninstall() {
+        let a = NSAlert()
+        a.messageText = "Uninstall SpaceKeeper?"
+        a.informativeText = "Removes the app, the watcher and the settings. Anything it already cleaned is not undone."
+        a.addButton(withTitle: "Uninstall")
+        a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        Task {
+            setenv("SPACEKEEPER_FROM_APP", "1", 1)
+            _ = await CLI.run(["uninstall"])
+            NSApp.terminate(nil)
+        }
     }
 
     func setGoal(_ gb: Int) {
@@ -749,6 +767,10 @@ struct PanelView: View {
             Toggle("Clean automatically below the goal",
                    isOn: Binding(get: { s.autoClean }, set: { v in Task { await e.setAutoClean(v) } }))
                 .disabled(!s.watching)
+            Button { e.confirmUninstall() } label: {
+                Label("Uninstall SpaceKeeper…", systemImage: "trash")
+            }
+            .buttonStyle(.borderless).foregroundStyle(.secondary)
             Toggle("Open at login", isOn: Binding(get: { launchAtLogin }, set: { v in
                 do {
                     if v { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
