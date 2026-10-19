@@ -226,6 +226,7 @@ final class AppState: ObservableObject {
     }
 
     var onRefresh: (() -> Void)?
+    var pedirJanela: (() -> Void)?
     private var lastRefresh = Date.distantPast
     private var goalTask: Task<Void, Never>?
 
@@ -643,6 +644,8 @@ struct PanelView: View {
                 Button { NSWorkspace.shared.open(url) } label: { Text("☕").font(.system(size: 14)) }
                     .help("Buy me a coffee — SpaceKeeper is free")
             }
+            Button { e.pedirJanela?() } label: { Image(systemName: "macwindow") }
+                .help("Open as a window")
             Button { Task { await e.refresh() } } label: { Image(systemName: "arrow.clockwise") }
                 .help("Refresh")
         }
@@ -1048,6 +1051,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var openTimer: Timer?
     var closeTimer: Timer?
     var pinned = false   // opened with a click: only closes on an outside click
+    var janela: NSWindow?
 
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -1067,6 +1071,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.animates = true
 
         state.onRefresh = { [weak self] in self?.updateIcon() }
+        state.pedirJanela = { [weak self] in self?.openWindow() }
 
         // hovering the icon opens it; moving away closes it
         if let m = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved], handler: { [weak self] _ in
@@ -1085,10 +1090,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await state.refresh()
             // first run (or the installer asked for it): open by itself and run the full scan
             let welcome = CommandLine.arguments.contains("--welcome")
-            if welcome || state.summary?.firstScanDone == false {
+            let primeira = welcome || state.summary?.firstScanDone == false
+            if primeira {
                 open(pinned: true)
                 await state.runScan()
             }
+            await askLaunchAtLogin()
+            // aberto por quem clicou no app (e não pelo login): mostra a janela
+            if !welcome && !primeira && !launchedAtLogin() && CommandLine.arguments.count == 1 { openWindow() }
         }
         if CommandLine.arguments.contains("--show") { open(pinned: true) }
         Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in
@@ -1101,15 +1110,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: janela (app de verdade), pergunta do login e ícone
+
+    /// Abre o app numa janela normal (Dock + Cmd-Tab) além do ícone da barra.
+    func openWindow() {
+        close(force: true)
+        if janela == nil {
+            let host = NSHostingController(rootView: PanelView().environmentObject(state))
+            host.sizingOptions = [.preferredContentSize]
+            let w = NSWindow(contentViewController: host)
+            w.title = "SpaceKeeper"
+            w.styleMask = [.titled, .closable, .miniaturizable]
+            w.isReleasedWhenClosed = false
+            w.center()
+            NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { [weak self] _ in
+                Task { @MainActor in
+                    self?.janela = nil
+                    NSApp.setActivationPolicy(.accessory)
+                }
+            }
+            janela = w
+        }
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        janela?.makeKeyAndOrderFront(nil)
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        openWindow()
+        return true
+    }
+
+    /// O macOS abriu o app sozinho no login? (nesse caso não mostra janela)
+    func launchedAtLogin() -> Bool {
+        let ev = NSAppleEventManager.shared().currentAppleEvent
+        return ev?.paramDescriptor(forKeyword: AEKeyword(keyAEPropData))?.enumCodeValue == AEKeyword(keyAELaunchedAsLogInItem)
+    }
+
+    /// Pergunta uma única vez se a pessoa quer abrir ao ligar o Mac.
+    func askLaunchAtLogin() async {
+        let d = UserDefaults.standard
+        guard !d.bool(forKey: "askedLaunchAtLogin") else { return }
+        d.set(true, forKey: "askedLaunchAtLogin")
+        if SMAppService.mainApp.status == .enabled { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "Open SpaceKeeper when you start your Mac?"
+        a.informativeText = "That keeps the icon in your menu bar, always watching your free space. You can change this later in Settings."
+        a.addButton(withTitle: "Yes, open at login")
+        a.addButton(withTitle: "Not now")
+        if a.runModal() == .alertFirstButtonReturn { try? SMAppService.mainApp.register() }
+    }
+
+    /// Ícone da barra: anel que mostra quanto do disco está livre.
+    func ring(_ free: Double, alert: Bool) -> NSImage {
+        let img = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+            let c = NSPoint(x: 9, y: 9)
+            let cor: NSColor = alert ? .systemRed : .black
+            cor.withAlphaComponent(0.28).setStroke()
+            let trilho = NSBezierPath()
+            trilho.appendArc(withCenter: c, radius: 6.5, startAngle: 0, endAngle: 360)
+            trilho.lineWidth = 2.2
+            trilho.stroke()
+            cor.setStroke()
+            let arco = NSBezierPath()
+            arco.appendArc(withCenter: c, radius: 6.5, startAngle: 90, endAngle: 90 - 360 * CGFloat(max(0.03, min(1, free))), clockwise: true)
+            arco.lineWidth = 2.2
+            arco.lineCapStyle = .round
+            arco.stroke()
+            cor.setFill()
+            NSBezierPath(ovalIn: NSRect(x: 7.2, y: 7.2, width: 3.6, height: 3.6)).fill()
+            return true
+        }
+        img.isTemplate = !alert
+        return img
+    }
+
     func updateIcon() {
         guard let b = item.button else { return }
         guard let s = state.summary else { b.title = ""; return }
         let gb = Int((Double(s.free) * 1024 / 1e9).rounded())
         let below = s.free < s.goalKb
         b.title = " \(gb) GB"
-        b.image = NSImage(systemSymbolName: below ? "exclamationmark.triangle.fill" : "internaldrive",
-                          accessibilityDescription: "SpaceKeeper")
-        b.contentTintColor = below ? .systemRed : nil
+        b.image = ring(Double(s.free) / Double(max(s.total, 1)), alert: below)
+        b.contentTintColor = nil
     }
 
     var iconFrame: NSRect {
